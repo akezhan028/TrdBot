@@ -33,13 +33,29 @@ except ImportError as e:
     DEPENDENCIES_OK = False
     MISSING_DEPS = str(e)
 
+# Локали интерфейса Threads: aria-label кнопок на разных языках
+LIKE_LABELS = ["Нравится", "Like"]
+REPLY_LABELS = ["Ответ", "Reply"]
+
+
+def svg_selector(labels):
+    """Собирает CSS-селектор svg по списку возможных aria-label"""
+    return ", ".join(f"svg[aria-label='{label}']" for label in labels)
+
+
 class ThreadsBotCore:
     """Основной класс бота"""
-    def __init__(self, log_callback=None, update_progress_callback=None):
+    def __init__(self, log_callback=None, update_progress_callback=None,
+                 dialog_callback=None, finished_callback=None):
         self.log_callback = log_callback or print
         self.update_progress_callback = update_progress_callback
+        self.dialog_callback = dialog_callback
+        self.finished_callback = finished_callback
         self.running = True
-        self.processed_posts = set()
+        # dict сохраняет порядок вставки (Python 3.7+), значения не используются
+        self.processed_posts = {}
+        # Посты, к которым уже пытались комментировать в текущем запуске
+        self.attempted_posts = set()
         self.processed_file = 'processed_posts.json'
         self.load_processed_posts()
         self.logs = []
@@ -67,11 +83,8 @@ class ThreadsBotCore:
         self.scroll_attempts = 5
         self.scroll_pause = 3000
         self.client = None
-        # Сохранение браузера между запусками
-        self.playwright = None
-        self.context = None
-        self.page = None
-        self.browser_reuse = True
+        # Закрывать браузер по завершении работы, чтобы не плодить процессы
+        self.browser_keep_open = False
 
     def update_progress(self, current_action="", progress_percent=0):
         """Обновление прогресса"""
@@ -105,22 +118,22 @@ class ThreadsBotCore:
             try:
                 with open(self.processed_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    self.processed_posts = set(data)
+                    self.processed_posts = dict.fromkeys(data)
                 self.log(f"[LOAD] Загружено {len(self.processed_posts)} обработанных постов")
             except Exception as e:
                 self.log(f"[ERROR] Ошибка загрузки processed_posts: {str(e)}")
-                self.processed_posts = set()
+                self.processed_posts = {}
         else:
-            self.processed_posts = set()
+            self.processed_posts = {}
 
     def save_processed_posts(self):
         """Сохранение обработанных постов в файл"""
         try:
             if len(self.processed_posts) > 1000:
-                temp_list = list(self.processed_posts)
-                temp_list = temp_list[-1000:]
-                self.processed_posts = set(temp_list)
-            
+                # dict сохраняет порядок вставки — оставляем 1000 самых свежих
+                recent_keys = list(self.processed_posts)[-1000:]
+                self.processed_posts = dict.fromkeys(recent_keys)
+
             with open(self.processed_file, 'w', encoding='utf-8') as f:
                 json.dump(list(self.processed_posts), f, ensure_ascii=False)
             self.log(f"[SAVE] Сохранено {len(self.processed_posts)} обработанных постов")
@@ -189,8 +202,9 @@ class ThreadsBotCore:
                 temperature=0.3
             )
             
-            analysis_text = response.choices[0].message.content.strip()
-            
+            content = response.choices[0].message.content
+            analysis_text = (content or "").strip()
+
             # Очищаем от markdown блоков если есть
             if analysis_text.startswith('```'):
                 lines = analysis_text.split('\n')
@@ -206,7 +220,7 @@ class ThreadsBotCore:
                 else:
                     analysis_text = analysis_text[:-3]
 
-            analysis_text = analysis_text.replace('``````', '').strip()
+            analysis_text = analysis_text.strip()
 
             # Парсим JSON
             try:
@@ -279,7 +293,10 @@ class ThreadsBotCore:
                 max_tokens=self.max_tokens_comments,
                 temperature=0.7
             )
-            comment = response.choices[0].message.content.strip()
+            content = response.choices[0].message.content
+            comment = (content or "").strip()
+            if not comment:
+                return "Интересный пост!"
             self.log(f"[AI] Комментарий ({tone}): {comment}")
             return comment
         except Exception as e:
@@ -327,42 +344,38 @@ class ThreadsBotCore:
             self.show_browser_error(str(e))
             return None, None, None
 
+    def _dialog(self, kind, title, message):
+        """Показ диалога через главный поток GUI (tkinter не потокобезопасен)"""
+        if self.dialog_callback:
+            return self.dialog_callback(kind, title, message)
+        return None
+
     def show_dependencies_error(self):
         """Показать ошибку отсутствия зависимостей"""
-        try:
-            root = tk.Tk()
-            root.withdraw()
-            messagebox.showerror(
-                "Отсутствуют зависимости",
-                f"Для работы бота необходимо установить зависимости:\n\n"
-                f"Ошибка: {MISSING_DEPS}\n\n"
-                f"Выполните в командной строке:\n"
-                f"pip install playwright openai pandas openpyxl\n"
-                f"playwright install chromium\n\n"
-                f"После установки перезапустите приложение."
-            )
-            root.destroy()
-        except:
-            pass
+        self._dialog(
+            "error",
+            "Отсутствуют зависимости",
+            f"Для работы бота необходимо установить зависимости:\n\n"
+            f"Ошибка: {MISSING_DEPS}\n\n"
+            f"Выполните в командной строке:\n"
+            f"pip install playwright openai pandas openpyxl\n"
+            f"playwright install chromium\n\n"
+            f"После установки перезапустите приложение."
+        )
 
     def show_browser_error(self, error_msg):
         """Показать ошибку браузера"""
-        try:
-            root = tk.Tk()
-            root.withdraw()
-            messagebox.showerror(
-                "Ошибка запуска браузера",
-                f"Не удалось запустить браузер:\n\n"
-                f"{error_msg}\n\n"
-                f"Возможные решения:\n"
-                f"-  Проверьте путь к профилю Chrome\n"
-                f"-  Закройте все окна Chrome\n"
-                f"-  Установите Chromium: playwright install chromium\n"
-                f"-  Попробуйте запустить без профиля (оставьте поле пустым)"
-            )
-            root.destroy()
-        except:
-            pass
+        self._dialog(
+            "error",
+            "Ошибка запуска браузера",
+            f"Не удалось запустить браузер:\n\n"
+            f"{error_msg}\n\n"
+            f"Возможные решения:\n"
+            f"-  Проверьте путь к профилю Chrome\n"
+            f"-  Закройте все окна Chrome\n"
+            f"-  Установите Chromium: playwright install chromium\n"
+            f"-  Попробуйте запустить без профиля (оставьте поле пустым)"
+        )
 
     def setup_threads(self, page):
         """Открытие и проверка авторизации в Threads"""
@@ -373,7 +386,7 @@ class ThreadsBotCore:
             time.sleep(5)
             if not self.running:
                 return False
-            page.wait_for_selector("svg[aria-label='Нравится']", timeout=15_000)
+            page.wait_for_selector(svg_selector(LIKE_LABELS), timeout=15_000)
             self.log("[OK] Авторизация успешна!")
             self.update_progress("Авторизация успешна", 20)
             return True
@@ -384,17 +397,14 @@ class ThreadsBotCore:
 
     def wait_for_manual_auth(self, page):
         """Ожидание ручной авторизации"""
-        root = tk.Tk()
-        root.withdraw()
-        result = messagebox.showinfo(
+        result = self._dialog(
+            "okcancel",
             "Требуется авторизация",
             "Войдите в свой аккаунт Threads в открывшемся браузере.\n\n"
             "После успешного входа нажмите 'OK' для продолжения работы бота.\n\n"
-            "Или нажмите 'Отмена' для остановки.",
-            type=messagebox.OKCANCEL
+            "Или нажмите 'Отмена' для остановки."
         )
-        root.destroy()
-        
+
         if result == 'ok':
             self.log("[OK] Пользователь подтвердил авторизацию")
             self.update_progress("Авторизация подтверждена", 20)
@@ -407,9 +417,8 @@ class ThreadsBotCore:
 
     def show_start_notification(self):
         """Показать уведомление о начале работы бота"""
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showinfo(
+        self._dialog(
+            "info",
             "Бот начинает работу!",
             "Отлично! Авторизация успешна.\n\n"
             "Бот сейчас начнет автоматически:\n"
@@ -420,13 +429,11 @@ class ThreadsBotCore:
             "Следите за прогрессом в интерфейсе.\n"
             "Для остановки нажмите кнопку 'ОСТАНОВИТЬ'."
         )
-        root.destroy()
 
     def show_finish_notification(self):
         """Показать уведомление о завершении работы"""
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showinfo(
+        self._dialog(
+            "info",
             "Работа завершена!",
             f"Бот завершил работу.\n\n"
             f"Статистика:\n"
@@ -436,7 +443,6 @@ class ThreadsBotCore:
             f"-  ИИ отфильтровано: {self.ai_filtered}\n\n"
             f"Данные об обработанных постах сохранены."
         )
-        root.destroy()
 
     def get_posts_on_screen(self, page):
         """Получение постов с экрана"""
@@ -452,7 +458,7 @@ class ThreadsBotCore:
     def like_post(self, post_element):
         """Лайк поста"""
         try:
-            like_btn = post_element.query_selector("svg[aria-label='Нравится']")
+            like_btn = post_element.query_selector(svg_selector(LIKE_LABELS))
             if like_btn:
                 like_btn.click()
                 self.log("[LIKE] Лайк поставлен")
@@ -466,7 +472,7 @@ class ThreadsBotCore:
         """Отправка комментария"""
         try:
             self.update_progress("Отправка комментария...", int((self.comments_made / self.max_comments) * 100))
-            reply_btn = post_element.query_selector("svg[aria-label='Ответ']")
+            reply_btn = post_element.query_selector(svg_selector(REPLY_LABELS))
             if not reply_btn:
                 return False
             
@@ -546,7 +552,8 @@ class ThreadsBotCore:
                         continue
                     
                     post_text_elements = post.query_selector_all("span[dir='auto']")
-                    post_text = " ".join([elem.inner_text().strip() for elem in post_text_elements if elem.inner_text().strip()])
+                    post_text_parts = [t for elem in post_text_elements if (t := elem.inner_text().strip())]
+                    post_text = " ".join(post_text_parts)
                     
                     if len(post_text) < self.min_post_length:
                         continue
@@ -559,44 +566,50 @@ class ThreadsBotCore:
                     unique_str = f"{post_author}:{post_text}"
                     post_id = hashlib.sha256(unique_str.encode('utf-8')).hexdigest()
                     
-                    if post_id in self.processed_posts:
+                    if post_id in self.processed_posts or post_id in self.attempted_posts:
                         self.log(f"[SKIP] Пост {self.posts_checked}: уже обработан (ID: {post_id[:10]}...)")
                         continue
-                    
+
                     # Проверка по ключевым словам
                     if not self.matches_topic_filter(post_text):
                         self.posts_filtered += 1
                         self.log(f"[SKIP] Пост {self.posts_checked}: не соответствует ключевым словам")
                         continue
-                    
+
                     # ИИ анализ поста
                     should_comment, tone = self.analyze_post_with_ai(post_text, post_author)
                     if not should_comment:
                         self.ai_filtered += 1
                         self.log(f"[AI-SKIP] Пост {self.posts_checked}: отфильтрован ИИ")
                         continue
-                    
+
                     found_matching_posts = True
-                    self.processed_posts.add(post_id)
-                    self.save_processed_posts()
-                    
+                    # Помечаем как попытку в рамках сессии, чтобы не зациклиться на посте,
+                    # но в постоянный список processed_posts запишем только при успехе
+                    self.attempted_posts.add(post_id)
+
                     self.log(f"[OK] Пост {self.posts_checked} от {post_author} (тон: {tone})")
                     self.log(f"[TEXT] {post_text}")
-                    
+
                     if not self.running:
                         break
-                    
+
                     self.like_post(post)
-                    
+
                     if not self.running:
                         break
-                    
+
                     comment = self.generate_comment(post_text, tone)
                     if comment and self.post_comment(page, post, comment):
+                        # Комментарий отправлен — только теперь фиксируем пост как обработанный
+                        self.processed_posts[post_id] = None
+                        self.save_processed_posts()
                         self.comments_made += 1
                         progress = int((self.comments_made / self.max_comments) * 75) + 25
                         self.update_progress(f"Комментарий {self.comments_made}/{self.max_comments} готов", progress)
                         self.log(f"[PROGRESS] Готово! ({self.comments_made}/{self.max_comments})")
+                    else:
+                        self.log(f"[WARN] Пост {self.posts_checked}: комментарий не отправлен, будет пропущен в этой сессии")
                     
                     if self.comments_made < self.max_comments and self.running:
                         delay = random.uniform(self.min_delay, self.max_delay)
@@ -619,30 +632,34 @@ class ThreadsBotCore:
 
     def run_bot(self, config):
         """Главная функция запуска бота"""
-        self.load_config_from_gui(config)
-        
-        if not self.api_key or not self.api_key.startswith('sk-'):
-            self.log("[ERROR] Неверный OpenAI API ключ!")
-            return
-        
-        playwright, context, page = self.setup_browser()
-        if not page:
-            return
-        
         try:
-            if self.setup_threads(page):
-                self.find_and_process_posts(page)
+            self.load_config_from_gui(config)
+
+            if not self.api_key or not self.api_key.startswith('sk-'):
+                self.log("[ERROR] Неверный OpenAI API ключ!")
+                return
+
+            playwright, context, page = self.setup_browser()
+            if not page:
+                return
+
+            try:
+                if self.setup_threads(page):
+                    self.find_and_process_posts(page)
+            finally:
+                self.save_processed_posts()
+                self.update_progress("Завершение работы", 100)
+                if not self.browser_keep_open:
+                    try:
+                        context.close()
+                        playwright.stop()
+                    except:
+                        pass
+                self.show_finish_notification()
+                self.log(f"[FINISH] Работа завершена! Комментариев: {self.comments_made}")
         finally:
-            self.save_processed_posts()
-            self.update_progress("Завершение работы", 100)
-            if not self.browser_keep_open:
-                try:
-                    context.close()
-                    playwright.stop()
-                except:
-                    pass
-            self.show_finish_notification()
-            self.log(f"[FINISH] Работа завершена! Комментариев: {self.comments_made}")
+            if self.finished_callback:
+                self.finished_callback()
 
 class ThreadsBotGUI:
     """GUI для бота Threads"""
@@ -904,10 +921,45 @@ class ThreadsBotGUI:
         self.stop_button.config(state='normal')
         self.progress_bar['value'] = 0
         
-        self.bot = ThreadsBotCore(log_callback=self.log_message, update_progress_callback=self.update_progress)
+        self.bot = ThreadsBotCore(
+            log_callback=self.log_message,
+            update_progress_callback=self.update_progress,
+            dialog_callback=self.show_dialog,
+            finished_callback=self.bot_finished
+        )
         self.bot_thread = threading.Thread(target=self.bot.run_bot, args=(config,))
         self.bot_thread.daemon = True
         self.bot_thread.start()
+
+    def show_dialog(self, kind, title, message):
+        """Показ диалога в главном потоке GUI, вызывается из потока бота"""
+        result = {}
+        done = threading.Event()
+
+        def _run():
+            try:
+                if kind == 'error':
+                    messagebox.showerror(title, message)
+                    result['value'] = 'ok'
+                elif kind == 'okcancel':
+                    result['value'] = 'ok' if messagebox.askokcancel(title, message) else 'cancel'
+                else:
+                    messagebox.showinfo(title, message)
+                    result['value'] = 'ok'
+            finally:
+                done.set()
+
+        self.root.after(0, _run)
+        done.wait()
+        return result.get('value')
+
+    def bot_finished(self):
+        """Сброс состояния GUI после завершения работы бота"""
+        self.root.after(0, self._bot_finished_gui)
+
+    def _bot_finished_gui(self):
+        self.start_button.config(state='normal')
+        self.stop_button.config(state='disabled')
 
     def stop_bot(self):
         """Остановка бота"""
