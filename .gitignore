@@ -1,10 +1,5 @@
-# Python
 __pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-
-# Bot runtime artifacts
+*.pyc
+.pytest_cache/
 processed_posts.json
 threads_bot_config.ini

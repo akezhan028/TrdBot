@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 
 """
-Threads Bot - Готовое приложение
-Все в одном файле: GUI + реальный бот
+Threads Bot - CS50P Final Project
+
+Автоматический ИИ-помощник для соцсети Threads: находит посты по темам,
+фильтрует их по ключевым словам и через OpenAI, генерирует релевантные
+комментарии и публикует их через Playwright. Управление - через GUI (tkinter).
+
+Структура под требования CS50P:
+  * main() и несколько функций верхнего уровня с чистой логикой;
+  * эти функции покрыты тестами в test_project.py (pytest);
+  * тяжёлые/GUI-зависимости импортируются мягко, чтобы модуль можно было
+    импортировать и тестировать в любом окружении.
 """
 
-import tkinter as tk
-from tkinter import ttk, scrolledtext, filedialog, messagebox
 import threading
 import time
 import random
@@ -21,6 +28,16 @@ import hashlib
 if sys.platform.startswith('win'):
     os.environ['PYTHONIOENCODING'] = 'utf-8'
 
+# GUI (tkinter). Импорт мягкий: без него можно импортировать модуль и
+# запускать тесты чистых функций, но нельзя запустить графический интерфейс.
+try:
+    import tkinter as tk
+    from tkinter import ttk, scrolledtext, filedialog, messagebox
+    GUI_AVAILABLE = True
+except ImportError as e:
+    GUI_AVAILABLE = False
+    GUI_IMPORT_ERROR = str(e)
+
 try:
     import pandas as pd
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -33,10 +50,75 @@ except ImportError as e:
 LIKE_LABELS = ["Нравится", "Like"]
 REPLY_LABELS = ["Ответ", "Reply"]
 
+# Карта замен эмодзи на текстовые метки (для консольных логов Windows).
+EMOJI_REPLACEMENTS = {
+    '🤖': '[BOT]', '🚀': '[START]', '✅': '[OK]', '❌': '[ERROR]',
+    '⚠️': '[WARN]', '📱': '[PHONE]', '💬': '[MSG]', '👍': '[LIKE]',
+    '🎯': '[TARGET]', '📊': '[STATS]', '🔄': '[RELOAD]', '⏳': '[WAIT]',
+    '🛑': '[STOP]', '📋': '[LIST]', '🎉': '[SUCCESS]', '⚪': '[SKIP]',
+    '🔍': '[SEARCH]', '📄': '[FILE]', '💾': '[SAVE]', '📏': '[MEASURE]',
+    '🖱️': '[MOUSE]', '📜': '[SCROLL]', '🔑': '[KEY]', '🚨': '[ALERT]',
+    '🧠': '[AI]', '🔬': '[ANALYZE]'
+}
+
+# Инструкции по тону для генерации комментариев.
+TONE_INSTRUCTIONS = {
+    "friendly": "Пиши дружелюбно и тепло",
+    "professional": "Пиши профессионально и сдержанно",
+    "enthusiastic": "Пиши с энтузиазмом и воодушевлением",
+    "supportive": "Пиши поддерживающе и ободряюще",
+    "neutral": "Пиши нейтрально и вежливо",
+}
+
 
 def svg_selector(labels):
     """Собирает CSS-селектор svg по списку возможных aria-label"""
     return ", ".join(f"svg[aria-label='{label}']" for label in labels)
+
+
+# ---------------------------------------------------------------------------
+# Функции верхнего уровня с чистой логикой (тестируются в test_project.py).
+# ---------------------------------------------------------------------------
+
+def clean_message(message):
+    """Заменяет эмодзи в строке на текстовые метки вида [OK], [ERROR] и т.д."""
+    for emoji, text in EMOJI_REPLACEMENTS.items():
+        message = message.replace(emoji, text)
+    return message
+
+
+def parse_keywords(keywords_str):
+    """Превращает строку "a, b , c" в список ключевых слов в нижнем регистре
+    без пустых элементов: ['a', 'b', 'c']."""
+    return [kw.strip().lower() for kw in keywords_str.split(',') if kw.strip()]
+
+
+def matches_topic_filter(post_text, keywords, min_matches=1):
+    """Проверяет, содержит ли текст поста хотя бы min_matches ключевых слов.
+    Пустой список ключевых слов означает "фильтр выключен" -> True."""
+    if not keywords:
+        return True
+    post_text_lower = post_text.lower()
+    matches = [keyword for keyword in keywords if keyword in post_text_lower]
+    return len(matches) >= min_matches
+
+
+def make_post_id(author, text):
+    """Возвращает стабильный SHA-256 идентификатор поста по автору и тексту.
+    Нужен, чтобы не комментировать один и тот же пост дважды."""
+    unique_str = f"{author}:{text}"
+    return hashlib.sha256(unique_str.encode('utf-8')).hexdigest()
+
+
+def is_valid_api_key(api_key):
+    """Проверяет, похож ли ключ на валидный ключ OpenAI (начинается с 'sk-')."""
+    return bool(api_key) and api_key.startswith('sk-')
+
+
+def select_tone_instruction(tone):
+    """Возвращает текстовую инструкцию для заданного тона; для неизвестного
+    тона используется нейтральная инструкция."""
+    return TONE_INSTRUCTIONS.get(tone, TONE_INSTRUCTIONS["neutral"])
 
 
 class ThreadsBotCore:
@@ -93,19 +175,8 @@ class ThreadsBotCore:
             self.log_callback(clean_message)
 
     def clean_message(self, message):
-        """Убираем эмодзи и заменяем на текст"""
-        replacements = {
-            '🤖': '[BOT]', '🚀': '[START]', '✅': '[OK]', '❌': '[ERROR]',
-            '⚠️': '[WARN]', '📱': '[PHONE]', '💬': '[MSG]', '👍': '[LIKE]',
-            '🎯': '[TARGET]', '📊': '[STATS]', '🔄': '[RELOAD]', '⏳': '[WAIT]',
-            '🛑': '[STOP]', '📋': '[LIST]', '🎉': '[SUCCESS]', '⚪': '[SKIP]',
-            '🔍': '[SEARCH]', '📄': '[FILE]', '💾': '[SAVE]', '📏': '[MEASURE]',
-            '🖱️': '[MOUSE]', '📜': '[SCROLL]', '🔑': '[KEY]', '🚨': '[ALERT]',
-            '🧠': '[AI]', '🔬': '[ANALYZE]'
-        }
-        for emoji, text in replacements.items():
-            message = message.replace(emoji, text)
-        return message
+        """Убираем эмодзи и заменяем на текст (см. clean_message верхнего уровня)."""
+        return clean_message(message)
 
     def load_processed_posts(self):
         """Загрузка обработанных постов из файла"""
@@ -147,7 +218,7 @@ class ThreadsBotCore:
         self.max_tokens_comments = config.get('max_tokens', 300)
         self.topic_filter_enabled = config.get('filter_enabled', True)
         keywords_str = config.get('keywords', '')
-        self.keywords = [kw.strip().lower() for kw in keywords_str.split(',') if kw.strip()]
+        self.keywords = parse_keywords(keywords_str)
         self.use_ai_filter = config.get('use_ai_filter', True)
 
         if self.api_key:
@@ -158,12 +229,10 @@ class ThreadsBotCore:
                 self.log(f"[ERROR] Ошибка OpenAI: {str(e)}")
 
     def matches_topic_filter(self, post_text):
-        """Проверка соответствия темам"""
-        if not self.topic_filter_enabled or not self.keywords:
+        """Проверка соответствия темам (см. matches_topic_filter верхнего уровня)."""
+        if not self.topic_filter_enabled:
             return True
-        post_text_lower = post_text.lower()
-        matches = [keyword for keyword in self.keywords if keyword in post_text_lower]
-        return len(matches) >= self.min_keyword_matches
+        return matches_topic_filter(post_text, self.keywords, self.min_keyword_matches)
 
     def analyze_post_with_ai(self, post_text, post_author):
         """ИИ анализ поста с улучшенным парсингом JSON"""
@@ -264,15 +333,7 @@ class ThreadsBotCore:
             self.log("[AI] Генерирую комментарий...")
             self.update_progress("Генерация комментария...", int((self.comments_made / self.max_comments) * 100))
 
-            tone_instructions = {
-                "friendly": "Пиши дружелюбно и тепло",
-                "professional": "Пиши профессионально и сдержанно",
-                "enthusiastic": "Пиши с энтузиазмом и воодушевлением",
-                "supportive": "Пиши поддерживающе и ободряюще",
-                "neutral": "Пиши нейтрально и вежливо"
-            }
-
-            tone_instruction = tone_instructions.get(tone, tone_instructions["neutral"])
+            tone_instruction = select_tone_instruction(tone)
 
             response = self.client.chat.completions.create(
                 model="gpt-4o",
@@ -553,8 +614,7 @@ class ThreadsBotCore:
                     author_elem = post.query_selector("a[role='link'] span")
                     post_author = author_elem.inner_text().strip() if author_elem else "unknown_user"
 
-                    unique_str = f"{post_author}:{post_text}"
-                    post_id = hashlib.sha256(unique_str.encode('utf-8')).hexdigest()
+                    post_id = make_post_id(post_author, post_text)
 
                     if post_id in self.processed_posts or post_id in self.attempted_posts:
                         self.log(f"[SKIP] Пост {self.posts_checked}: уже обработан (ID: {post_id[:10]}...)")
@@ -622,7 +682,7 @@ class ThreadsBotCore:
         try:
             self.load_config_from_gui(config)
 
-            if not self.api_key or not self.api_key.startswith('sk-'):
+            if not is_valid_api_key(self.api_key):
                 self.log("[ERROR] Неверный OpenAI API ключ!")
                 return
 
@@ -1027,7 +1087,15 @@ class ThreadsBotGUI:
         """Запуск GUI"""
         self.root.mainloop()
 
-if __name__ == "__main__":
+def main():
+    """Точка входа: запускает графический интерфейс бота Threads."""
+    if not GUI_AVAILABLE:
+        print("[ERROR] GUI недоступен: не установлен tkinter "
+              f"({GUI_IMPORT_ERROR}).")
+        print("[INFO] Установите tkinter (например, 'sudo apt install "
+              "python3-tk') и запустите снова.")
+        return
+
     def signal_handler(signum, frame):
         print("\nПрерывание программы...")
         sys.exit(0)
@@ -1037,3 +1105,7 @@ if __name__ == "__main__":
 
     app = ThreadsBotGUI()
     app.run()
+
+
+if __name__ == "__main__":
+    main()
